@@ -1,0 +1,160 @@
+---
+# The getting-started Pipeline will run through several tasks:
+# - source is pulled from git
+# - source is built into an image by img
+# - image output is pushed to ECR
+# - cloudevent emitted
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: getting-started-pipeline
+  namespace: getting-started
+spec:
+  params:
+    - name: image
+      type: string
+      description: image URL to push
+  resources:
+    - name: source-repo
+      type: git
+    - name: image-source
+      type: image
+    - name: event-to-sink
+      type: cloudEvent
+  workspaces:
+    - name: source-workspace # Directory where application source is located. (REQUIRED)
+    #- name: cache-workspace # Directory where cache is stored (OPTIONAL)
+  tasks:
+    - name: fetch-repository # This task fetches a repository from github, using the `git-clone` task you installed
+      taskRef:
+        name: git-clone
+      workspaces:
+        - name: output
+          workspace: source-workspace
+      params:
+        - name: url
+          value: https://github.com/jspruance/ocean-api.git
+        - name: subdirectory
+          value: ""
+        - name: deleteExisting
+          value: "true"
+    - name: buildpacks # This task uses the `buildpacks` task to build the application
+      taskRef:
+        name: buildpacks
+      runAfter:
+        - fetch-repository
+      workspaces:
+        - name: source
+          workspace: source-workspace
+        #- name: cache
+        #  workspace: cache-workspace
+      params:
+        - name: APP_IMAGE
+          value: "$(params.image)"
+        - name: SOURCE_SUBPATH
+          value: "" # This is the path within the samples repo you want to build (OPTIONAL, default: "")
+        - name: BUILDER_IMAGE
+          value: paketobuildpacks/builder:base # This is the builder we want the task to use (REQUIRED)
+    - name: display-results
+      runAfter:
+        - buildpacks
+      taskSpec:
+        steps:
+          - name: print
+            image: docker.io/library/bash:5.1.4@sha256:b208215a4655538be652b2769d82e576bc4d0a2bb132144c060efc5be8c3f5d6
+            script: |
+              #!/usr/bin/env bash
+              set -e
+              echo "Digest of created app image: $(params.DIGEST)"              
+        params:
+          - name: DIGEST
+      params:
+        - name: DIGEST
+          value: $(tasks.buildpacks.results.APP_IMAGE_DIGEST)
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: deploy-locally
+  namespace: getting-started
+spec:
+  resources:
+    inputs:
+      - name: image-source
+        type: image
+    outputs:
+    - name: event-to-sink
+      type: cloudEvent
+  steps:
+    - name: run-kubectl
+      image: lachlanevenson/k8s-kubectl
+      command: ["kubectl"]
+      args:
+        - "run"
+        - "tekton-triggers-built-me"
+        - "--image"
+        - "$(resources.inputs.image-source.url)"
+        - "--env=PORT=8080"
+---
+apiVersion: tekton.dev/v1beta1
+kind: Task
+metadata:
+  name: build-docker-image
+  namespace: getting-started
+spec:
+  params:
+  - name: pathToContext
+    description:
+      The build directory used by img
+    default: /workspace/source-repo
+  - name: pathToDockerFile
+    type: string
+    description: The path to the dockerfile to build
+    default: $(resources.inputs.source-repo.path)/Dockerfile
+  resources:
+    inputs:
+      - name: source-repo
+        type: git
+    outputs:
+      - name: builtImage
+        type: image
+  steps:
+    - name: build-and-push
+      image: gcr.io/kaniko-project/executor:v0.16.0
+      command:
+        - /kaniko/executor
+      args:
+        - --dockerfile=$(params.pathToDockerFile)
+        - --destination=$(resources.outputs.builtImage.url)
+        - --context=$(params.pathToContext)
+---
+# Finally, we need something to receive our cloudevent announcing success!
+# That is this services only purpose
+apiVersion: v1
+kind: Service
+metadata:
+  name: event-display
+  namespace: getting-started
+  labels:
+    app: event-display
+spec:
+  type: ClusterIP
+  ports:
+    - name: listener
+      port: 8080
+      protocol: TCP
+  selector:
+    app: event-display
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: event-display
+  namespace: getting-started
+  labels:
+    app: event-display
+spec:
+  hostname: event-display
+  containers:
+  - image: gcr.io/knative-releases/github.com/knative/eventing-sources/cmd/event_display
+    name: web
